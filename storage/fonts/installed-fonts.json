@@ -1,0 +1,14 @@
+{
+    "tajawal": {
+        "normal": "C:\\xampp\\htdocs\\laravel-invoices-starter\\storage\\fonts\/tajawal_normal_cd89ddc762f80ce51e85f6b91b6b2876",
+        "bold": "tajawal_bold_3874c72ecf24ece3af56e6c2e68ab103"
+    },
+    "amiri": {
+        "normal": "C:\\xampp\\htdocs\\laravel-invoices-starter\\storage\\fonts\/amiri_normal_ae24a9ee88061eae6a7fa6e6f08bac00",
+        "bold": "amiri_bold_6dcb70f65f0760709ce4ade62eb65871"
+    },
+    "cairo": {
+        "normal": "C:\\xampp\\htdocs\\laravel-invoices-starter\\storage\\fonts\/cairo_normal_2064a2b895e0c6d94cbcfa58cb423e88",
+        "bold": "cairo_bold_2064a2b895e0c6d94cbcfa58cb423e88"
+    }
+}
