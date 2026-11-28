@@ -24,8 +24,8 @@ class ReportService
      */
     public function getReportData(array $filters, User $user): array
     {
-        // Scope to user if not viewing as administrator or if user specifically selects own scope
-        $userId = $user->isAdmin() ? ($filters['user_id'] ?? null) : $user->id;
+        // Scope report strictly to the authenticated user's own data (even for administrators)
+        $userId = $user->id;
 
         /** @var Collection $invoices */
         $invoices = $this->invoiceRepo->getFiltered($filters, $userId);

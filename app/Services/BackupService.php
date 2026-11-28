@@ -3,14 +3,15 @@
 namespace App\Services;
 
 use Carbon\Carbon;
-use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Storage;
-use PDO;
-use ZipArchive;
+use Spatie\Backup\BackupDestination\Backup;
+use Spatie\Backup\BackupDestination\BackupDestination;
 
 class BackupService
 {
+    protected string $diskName = 'backups';
     protected string $backupDir;
 
     public function __construct()
@@ -22,88 +23,88 @@ class BackupService
     }
 
     /**
-     * Create a complete backup (database SQL dump + uploaded files) into a ZIP archive.
+     * Create a backup archive using Spatie Laravel Backup.
      */
     public function createBackup(string $triggeredBy = 'System'): array
     {
-        $timestamp = now()->format('Y-m-d-His');
-        $zipFileName = "backup-{$timestamp}.zip";
-        $zipFilePath = $this->backupDir . DIRECTORY_SEPARATOR . $zipFileName;
+        // When running tests with in-memory SQLite, dump is skipped as in-memory SQLite cannot be dumped via CLI
+        $isInMemorySqlite = config('database.default') === 'sqlite'
+            && config('database.connections.sqlite.database') === ':memory:';
 
-        // 1. Generate Database SQL Dump using PDO
-        $sqlDump = $this->generateDatabaseDump();
-        $tempSqlFile = storage_path("app/temp_dump_{$timestamp}.sql");
-        File::put($tempSqlFile, $sqlDump);
+        $options = $isInMemorySqlite ? ['--only-files' => true] : [];
 
-        // 2. Create ZIP archive
-        $zip = new ZipArchive();
-        if ($zip->open($zipFilePath, ZipArchive::CREATE | ZipArchive::OVERWRITE) === true) {
-            // Add SQL dump
-            $zip->addFile($tempSqlFile, 'database.sql');
+        $exitCode = Artisan::call('backup:run', $options);
 
-            // Add uploaded files from storage/app/public
-            $publicStoragePath = storage_path('app/public');
-            if (File::isDirectory($publicStoragePath)) {
-                $files = File::allFiles($publicStoragePath);
-                foreach ($files as $file) {
-                    $relativePath = 'uploads/' . $file->getRelativePathname();
-                    $zip->addFile($file->getRealPath(), $relativePath);
-                }
-            }
-
-            // Add metadata
-            $metadata = [
-                'created_at'   => now()->toDateTimeString(),
-                'triggered_by' => $triggeredBy,
-                'app_name'     => config('app.name'),
-                'database'     => config('database.connections.mysql.database'),
-                'php_version'  => PHP_VERSION,
-            ];
-            $zip->addFromString('metadata.json', json_encode($metadata, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-
-            $zip->close();
+        if ($exitCode !== 0) {
+            $output = trim(Artisan::output());
+            throw new \RuntimeException('فشل تنفيذ النسخ الاحتياطي عبر spatie/laravel-backup: ' . $output);
         }
 
-        // Cleanup temporary SQL file
-        if (File::exists($tempSqlFile)) {
-            File::delete($tempSqlFile);
-        }
+        $destination = $this->getBackupDestination();
+        /** @var Backup|null $newestBackup */
+        $newestBackup = $destination->newestBackup();
 
-        // 3. Clean old backups (keep last 14 days)
-        $this->cleanOldBackups(14);
-
-        $fileSize = File::exists($zipFilePath) ? File::size($zipFilePath) : 0;
+        $filename = $newestBackup ? basename($newestBackup->path()) : 'backup-' . now()->format('Y-m-d-His') . '.zip';
+        $fullPath = $newestBackup ? storage_path('app/backups/' . $newestBackup->path()) : $this->backupDir . DIRECTORY_SEPARATOR . $filename;
+        $sizeMb = $newestBackup ? round($newestBackup->sizeInBytes() / 1024 / 1024, 2) : 0;
+        $createdAt = $newestBackup ? $newestBackup->date()->format('Y-m-d H:i:s') : now()->format('Y-m-d H:i:s');
 
         activity()
             ->causedBy(auth()->user())
-            ->log("تم إنشاء نسخة احتياطية جديدة بنجاح: {$zipFileName} (" . round($fileSize / 1024 / 1024, 2) . " ميجابايت)");
+            ->log("تم إنشاء نسخة احتياطية جديدة بنجاح عبر Spatie Backup: {$filename} ({$sizeMb} ميجابايت) - المصدر: {$triggeredBy}");
 
         return [
-            'success'   => true,
-            'filename'  => $zipFileName,
-            'path'      => $zipFilePath,
-            'size_kb'   => round($fileSize / 1024, 2),
-            'size_mb'   => round($fileSize / 1024 / 1024, 2),
-            'timestamp' => $timestamp,
+            'success'    => true,
+            'filename'   => $filename,
+            'path'       => $fullPath,
+            'size_mb'    => $sizeMb,
+            'created_at' => $createdAt,
         ];
     }
 
     /**
-     * List all existing backup archives.
+     * List all existing backup archives from Spatie backup destination.
      */
     public function listBackups(): array
     {
-        $files = File::files($this->backupDir);
+        $destination = $this->getBackupDestination();
         $backups = [];
+        $recordedFiles = [];
 
-        foreach ($files as $file) {
+        // 1. Spatie Backups
+        if ($destination->isReachable()) {
+            foreach ($destination->backups() as $b) {
+                if ($b->exists()) {
+                    $filename = basename($b->path());
+                    $recordedFiles[$filename] = true;
+
+                    $backups[] = [
+                        'filename'   => $filename,
+                        'rel_path'   => $b->path(),
+                        'path'       => storage_path('app/backups/' . $b->path()),
+                        'size_mb'    => round($b->sizeInBytes() / 1024 / 1024, 2),
+                        'created_at' => $b->date()->format('Y-m-d H:i:s'),
+                        'is_spatie'  => true,
+                    ];
+                }
+            }
+        }
+
+        // 2. Legacy / Root directory backups for backwards compatibility
+        $rootFiles = File::files($this->backupDir);
+        foreach ($rootFiles as $file) {
             if ($file->getExtension() === 'zip') {
-                $backups[] = [
-                    'filename'   => $file->getFilename(),
-                    'path'       => $file->getRealPath(),
-                    'size_mb'    => round($file->getSize() / 1024 / 1024, 2),
-                    'created_at' => Carbon::createFromTimestamp($file->getMTime())->format('Y-m-d H:i:s'),
-                ];
+                $filename = $file->getFilename();
+                if (! isset($recordedFiles[$filename])) {
+                    $backups[] = [
+                        'filename'   => $filename,
+                        'rel_path'   => $filename,
+                        'path'       => $file->getRealPath(),
+                        'size_mb'    => round($file->getSize() / 1024 / 1024, 2),
+                        'created_at' => Carbon::createFromTimestamp($file->getMTime())->format('Y-m-d H:i:s'),
+                        'is_spatie'  => false,
+                    ];
+                }
             }
         }
 
@@ -114,17 +115,40 @@ class BackupService
     }
 
     /**
+     * Find the full path of a backup by filename safely.
+     */
+    public function findBackupPath(string $filename): ?string
+    {
+        $safeName = basename($filename);
+        $appName = config('backup.backup.name', 'invoices-backup');
+
+        // Check inside Spatie app directory
+        $spatiePath = $this->backupDir . DIRECTORY_SEPARATOR . $appName . DIRECTORY_SEPARATOR . $safeName;
+        if (File::exists($spatiePath)) {
+            return $spatiePath;
+        }
+
+        // Check inside root backup directory
+        $rootPath = $this->backupDir . DIRECTORY_SEPARATOR . $safeName;
+        if (File::exists($rootPath)) {
+            return $rootPath;
+        }
+
+        return null;
+    }
+
+    /**
      * Delete an existing backup file.
      */
     public function deleteBackup(string $filename): bool
     {
-        $safeFilename = basename($filename);
-        $path = $this->backupDir . DIRECTORY_SEPARATOR . $safeFilename;
+        $path = $this->findBackupPath($filename);
 
-        if (File::exists($path)) {
+        if ($path && File::exists($path)) {
+            $safeName = basename($path);
             activity()
                 ->causedBy(auth()->user())
-                ->log("قام بحذف النسخة الاحتياطية: {$safeFilename}");
+                ->log("قام بحذف النسخة الاحتياطية: {$safeName}");
 
             return File::delete($path);
         }
@@ -133,10 +157,13 @@ class BackupService
     }
 
     /**
-     * Delete backups older than $days.
+     * Clean old backups using Spatie clean command.
      */
     public function cleanOldBackups(int $days = 14): void
     {
+        Artisan::call('backup:clean');
+
+        // Clean legacy loose files older than $days
         $threshold = now()->subDays($days)->timestamp;
         $files = File::files($this->backupDir);
 
@@ -148,88 +175,12 @@ class BackupService
     }
 
     /**
-     * Generate complete MySQL SQL Dump using PDO.
+     * Get Spatie Backup destination instance.
      */
-    protected function generateDatabaseDump(): string
+    public function getBackupDestination(): BackupDestination
     {
-        /** @var PDO $pdo */
-        $pdo = DB::connection()->getPdo();
-        $driver = DB::connection()->getDriverName();
-        $dbName = DB::connection()->getDatabaseName();
+        $appName = config('backup.backup.name', 'invoices-backup');
 
-        $output = "-- ====================================================\n";
-        $output .= "-- Laravel Invoices System Database Backup\n";
-        $output .= "-- Driver: {$driver} | Database: {$dbName}\n";
-        $output .= "-- Generated: " . now()->toDateTimeString() . "\n";
-        $output .= "-- ====================================================\n\n";
-
-        if ($driver === 'sqlite') {
-            $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")->fetchAll(PDO::FETCH_COLUMN);
-
-            foreach ($tables as $table) {
-                $stmt = $pdo->query("SELECT sql FROM sqlite_master WHERE type='table' AND name='{$table}'");
-                $createSql = $stmt->fetchColumn();
-                $output .= "DROP TABLE IF EXISTS `{$table}`;\n";
-                if ($createSql) {
-                    $output .= $createSql . ";\n\n";
-                }
-
-                $dataStmt = $pdo->query("SELECT * FROM `{$table}`");
-                $rows = $dataStmt->fetchAll(PDO::FETCH_ASSOC);
-
-                if (! empty($rows)) {
-                    $output .= "-- Dumping data for table `{$table}`\n";
-                    foreach ($rows as $dataRow) {
-                        $columns = array_map(fn ($col) => "`{$col}`", array_keys($dataRow));
-                        $values = array_map(fn ($val) => $val === null ? 'NULL' : $pdo->quote((string) $val), array_values($dataRow));
-                        $output .= "INSERT INTO `{$table}` (" . implode(', ', $columns) . ") VALUES (" . implode(', ', $values) . ");\n";
-                    }
-                    $output .= "\n";
-                }
-            }
-
-            return $output;
-        }
-
-        $output .= "SET FOREIGN_KEY_CHECKS=0;\n\n";
-
-        // Fetch all tables
-        $tables = $pdo->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);
-
-        foreach ($tables as $table) {
-            // Drop & Create statement
-            $output .= "-- ----------------------------------------------------\n";
-            $output .= "-- Table structure for `{$table}`\n";
-            $output .= "-- ----------------------------------------------------\n";
-            $output .= "DROP TABLE IF EXISTS `{$table}`;\n";
-
-            $stmt = $pdo->query("SHOW CREATE TABLE `{$table}`");
-            $row = $stmt->fetch(PDO::FETCH_NUM);
-            $output .= ($row[1] ?? '') . ";\n\n";
-
-            // Insert rows
-            $dataStmt = $pdo->query("SELECT * FROM `{$table}`");
-            $rows = $dataStmt->fetchAll(PDO::FETCH_ASSOC);
-
-            if (! empty($rows)) {
-                $output .= "-- Dumping data for table `{$table}`\n";
-                foreach ($rows as $dataRow) {
-                    $columns = array_map(fn ($col) => "`{$col}`", array_keys($dataRow));
-                    $values = array_map(function ($val) use ($pdo) {
-                        if ($val === null) {
-                            return 'NULL';
-                        }
-                        return $pdo->quote((string) $val);
-                    }, array_values($dataRow));
-
-                    $output .= "INSERT INTO `{$table}` (" . implode(', ', $columns) . ") VALUES (" . implode(', ', $values) . ");\n";
-                }
-                $output .= "\n";
-            }
-        }
-
-        $output .= "SET FOREIGN_KEY_CHECKS=1;\n";
-
-        return $output;
+        return BackupDestination::create($this->diskName, $appName);
     }
 }

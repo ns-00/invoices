@@ -151,5 +151,20 @@ class UserRoleSeparationTest extends TestCase
         $adminProject = Project::where('name', 'مشروع خاص بالمدير')->first();
         $this->assertNotNull($adminProject);
         $this->assertEquals($admin->id, $adminProject->user_id);
+
+        // 11. In reports, admin ONLY sees their own invoices and NOT User A's invoice
+        $adminMonth = $adminProject->months()->create(['ym' => '2026-11', 'closed' => false]);
+        $adminInvoice = $adminMonth->invoices()->create([
+            'number'       => 'INV-ADMIN-1',
+            'invoice_date' => '2026-11-25',
+            'amount'       => 1500,
+            'has_due'      => false,
+        ]);
+
+        $reportsResp = $this->get(route('reports.index'));
+        $reportsResp->assertStatus(200);
+        $reportsResp->assertSee('INV-ADMIN-1');
+        $reportsResp->assertDontSee('INV-A-1');
+        $reportsResp->assertDontSee('مشروع المستخدم أ');
     }
 }

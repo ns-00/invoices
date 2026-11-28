@@ -198,5 +198,24 @@ class ReportAndFeatureTest extends TestCase
         $resp = $this->actingAs($admin)->get(route('backups.index'));
         $resp->assertStatus(200);
         $resp->assertSee('إدارة النسخ الاحتياطية');
+
+        // Test web backup creation
+        $createResp = $this->actingAs($admin)->post(route('backups.create'));
+        $createResp->assertSessionHas('ok');
+
+        // Get latest backup
+        $backupService = app(\App\Services\BackupService::class);
+        $backups = $backupService->listBackups();
+        $this->assertNotEmpty($backups);
+
+        $latestFilename = $backups[0]['filename'];
+
+        // Test download route
+        $downloadResp = $this->actingAs($admin)->get(route('backups.download', $latestFilename));
+        $downloadResp->assertStatus(200);
+
+        // Test delete route
+        $deleteResp = $this->actingAs($admin)->delete(route('backups.destroy', $latestFilename));
+        $deleteResp->assertSessionHas('ok');
     }
 }

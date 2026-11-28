@@ -15,24 +15,38 @@ class BackupController extends Controller
     public function index()
     {
         $backups = $this->backupService->listBackups();
+        $destination = $this->backupService->getBackupDestination();
 
-        return view('backups.index', compact('backups'));
+        $stats = [
+            'total_backups' => count($backups),
+            'used_mb'       => round($destination->usedStorage() / 1024 / 1024, 2),
+            'is_healthy'    => $destination->isReachable(),
+            'newest'        => $destination->newestBackup()?->date()?->format('Y-m-d H:i') ?? '—',
+        ];
+
+        return view('backups.index', compact('backups', 'stats'));
     }
 
     public function create(Request $request)
     {
         $user = $request->user();
-        $result = $this->backupService->createBackup($user->name . ' (' . $user->email . ')');
+        $source = $user ? "المستخدم: {$user->name} ({$user->email})" : 'لوحة الإدارة';
 
-        return back()->with('ok', "تم إنشاء النسخة الاحتياطية بنجاح: {$result['filename']} بحجم ({$result['size_mb']} ميجابايت).");
+        try {
+            $result = $this->backupService->createBackup($source);
+
+            return back()->with('ok', "تم إنشاء النسخة الاحتياطية بنجاح عبر Spatie Backup: {$result['filename']} بحجم ({$result['size_mb']} ميجابايت).");
+        } catch (\Throwable $e) {
+            return back()->withErrors(['backup' => 'فشل إنشاء النسخة الاحتياطية: ' . $e->getMessage()]);
+        }
     }
 
     public function download(string $filename)
     {
         $safeFilename = basename($filename);
-        $path = storage_path('app/backups/' . $safeFilename);
+        $path = $this->backupService->findBackupPath($safeFilename);
 
-        if (! file_exists($path)) {
+        if (! $path || ! file_exists($path)) {
             abort(404, 'ملف النسخة الاحتياطية غير موجود.');
         }
 
@@ -40,7 +54,7 @@ class BackupController extends Controller
             ->causedBy(auth()->user())
             ->log("قام بتحميل النسخة الاحتياطية: {$safeFilename}");
 
-        return response()->download($path);
+        return response()->download($path, $safeFilename);
     }
 
     public function destroy(string $filename)
